@@ -4,6 +4,53 @@
 
 namespace coords {
 
+namespace {
+
+// OGRCoordinateTransformation 内部持有 PROJ 上下文与坐标操作对象，不能被多个
+// 线程并发使用；引擎的转换工作线程各自持有一个实例。
+struct OGRCTDeleter {
+    void operator()(OGRCoordinateTransformation* pCT) const {
+        if (pCT != nullptr) {
+            OGRCoordinateTransformation::DestroyCT(pCT);
+        }
+    }
+};
+
+using OGRCTPtr = std::unique_ptr<OGRCoordinateTransformation, OGRCTDeleter>;
+
+thread_local OGRCTPtr tl_ogr_transform{nullptr};
+thread_local std::string tl_ogr_transform_key;
+
+OGRCTPtr CreateOGRTransformFor(const CoordinateSystem& source_cs) {
+    OGRSpatialReference outRs;
+    outRs.importFromEPSG(4326);
+    outRs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    OGRSpatialReference inRs;
+    inRs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+
+    if (source_cs.Type() == CoordinateType::EPSG) {
+        auto code = source_cs.GetEPSGCode();
+        if (!code) {
+            return OGRCTPtr(nullptr);
+        }
+        inRs.importFromEPSG(*code);
+    } else if (source_cs.Type() == CoordinateType::WKT) {
+        auto wkt = source_cs.GetWKTString();
+        if (!wkt) {
+            return OGRCTPtr(nullptr);
+        }
+        inRs.importFromWkt(wkt->c_str());
+    } else {
+        return OGRCTPtr(nullptr);
+    }
+
+    OGRCoordinateTransformation* poCT = OGRCreateCoordinateTransformation(&inRs, &outRs);
+    return OGRCTPtr(poCT);
+}
+
+} // namespace
+
 // WGS84椭球参数
 // 长半轴和扁率用于ECEF坐标计算
 static constexpr double WGS84_A = 6378137.0;                    // 长半轴(米)
@@ -48,7 +95,7 @@ CoordinateTransformer::CoordinateTransformer(CoordinateTransformer&& other) noex
     , enu_to_ecef_(other.enu_to_ecef_)
     , ecef_to_enu_(other.ecef_to_enu_)
     , axis_transform_(other.axis_transform_)
-    , ogr_transform_(std::move(other.ogr_transform_))
+    , ogr_transform_key_(std::move(other.ogr_transform_key_))
     , geoid_config_(other.geoid_config_) {
 }
 
@@ -62,7 +109,7 @@ CoordinateTransformer& CoordinateTransformer::operator=(CoordinateTransformer&& 
         enu_to_ecef_ = other.enu_to_ecef_;
         ecef_to_enu_ = other.ecef_to_enu_;
         axis_transform_ = other.axis_transform_;
-        ogr_transform_ = std::move(other.ogr_transform_);
+        ogr_transform_key_ = std::move(other.ogr_transform_key_);
         geoid_config_ = other.geoid_config_;
     }
     return *this;
@@ -98,8 +145,8 @@ void CoordinateTransformer::InitializeWithGeoRef(const GeoReference& geo_ref) {
             auto [origin_x, origin_y, origin_z] = source_cs_.GetSourceOrigin();
             glm::dvec3 origin{origin_x, origin_y, origin_z};
 
-            if (ogr_transform_) {
-                ogr_transform_->Transform(1, &origin.x, &origin.y, &origin.z);
+            if (auto* ct = GetThreadOGRTransform()) {
+                ct->Transform(1, &origin.x, &origin.y, &origin.z);
             }
 
             geo_origin_lon_ = origin.x;
@@ -130,37 +177,44 @@ void CoordinateTransformer::InitializeWithGeoRef(const GeoReference& geo_ref) {
 }
 
 void CoordinateTransformer::CreateOGRTransform() {
-    // 创建目标坐标系(WGS84)
-    OGRSpatialReference outRs;
-    outRs.importFromEPSG(4326);
-    outRs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
-
-    // 创建源坐标系
-    OGRSpatialReference inRs;
-    inRs.SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
+    ogr_transform_key_.clear();
 
     if (source_cs_.Type() == CoordinateType::EPSG) {
-        // 从EPSG编码创建
         auto code = source_cs_.GetEPSGCode();
         if (code) {
-            inRs.importFromEPSG(*code);
+            ogr_transform_key_ = "EPSG:" + std::to_string(*code);
         }
     } else if (source_cs_.Type() == CoordinateType::WKT) {
-        // 从WKT字符串创建
         auto wkt = source_cs_.GetWKTString();
         if (wkt) {
-            inRs.importFromWkt(wkt->c_str());
+            ogr_transform_key_ = "WKT:" + *wkt;
         }
     }
 
-    // 创建坐标转换器
-    OGRCoordinateTransformation* poCT = OGRCreateCoordinateTransformation(&inRs, &outRs);
-    if (poCT) {
-        ogr_transform_.reset(poCT);
+    if (ogr_transform_key_.empty()) {
+        fprintf(stderr, "[CoordinateTransformer] Failed to create OGR transform\n");
+        return;
+    }
+    ogr_transform_key_ += "->EPSG:4326";
+
+    // 在初始化线程验证转换对象可以创建；转换工作线程第一次调用时会各自创建。
+    if (GetThreadOGRTransform() != nullptr) {
         fprintf(stderr, "[CoordinateTransformer] OGR transform created successfully\n");
     } else {
+        ogr_transform_key_.clear();
         fprintf(stderr, "[CoordinateTransformer] Failed to create OGR transform\n");
     }
+}
+
+OGRCoordinateTransformation* CoordinateTransformer::GetThreadOGRTransform() const {
+    if (ogr_transform_key_.empty()) {
+        return nullptr;
+    }
+    if (!tl_ogr_transform || tl_ogr_transform_key != ogr_transform_key_) {
+        tl_ogr_transform = CreateOGRTransformFor(source_cs_);
+        tl_ogr_transform_key = tl_ogr_transform ? ogr_transform_key_ : std::string();
+    }
+    return tl_ogr_transform.get();
 }
 
 bool CoordinateTransformer::ShouldApplyGeoidCorrection() const {
@@ -228,15 +282,17 @@ glm::dvec3 CoordinateTransformer::ToWGS84(const glm::dvec3& point) const {
         // ECEF → WGS84 (简化处理，实际应使用迭代算法)
         // 这里返回地理原点作为近似
         return {geo_origin_lon_, geo_origin_lat_, geo_origin_height_ + result.z};
-    } else if (source_cs_.NeedsOGRTransform() && ogr_transform_) {
-        // EPSG/WKT: 使用OGR转换
+    } else if (source_cs_.NeedsOGRTransform()) {
+        // EPSG/WKT: 使用当前线程自己的 OGR 转换对象
         // 先减去原点偏移
         auto [origin_x, origin_y, origin_z] = source_cs_.GetSourceOrigin();
         result.x += origin_x;
         result.y += origin_y;
         result.z += origin_z;
 
-        ogr_transform_->Transform(1, &result.x, &result.y, &result.z);
+        if (auto* ct = GetThreadOGRTransform()) {
+            ct->Transform(1, &result.x, &result.y, &result.z);
+        }
     } else {
         // LocalCartesian: 使用地理原点
         result = {geo_origin_lon_, geo_origin_lat_, geo_origin_height_ + result.z};
@@ -295,7 +351,7 @@ glm::dvec3 CoordinateTransformer::ToLocalENU(const glm::dvec3& point) const {
         // 3. ECEF → 局部ENU（使用地理原点的ECEF→ENU矩阵）
         glm::dvec4 enu = ecef_to_enu_ * glm::dvec4(ecef, 1.0);
         return {enu.x, enu.y, enu.z};
-    } else if (source_cs_.NeedsOGRTransform() && ogr_transform_) {
+    } else if (source_cs_.NeedsOGRTransform()) {
         // EPSG/WKT类型：Point是投影坐标
         // 1. 加上源坐标原点偏移
         auto [origin_x, origin_y, origin_z] = source_cs_.GetSourceOrigin();
@@ -303,8 +359,10 @@ glm::dvec3 CoordinateTransformer::ToLocalENU(const glm::dvec3& point) const {
         result.y += origin_y;
         result.z += origin_z;
 
-        // 2. 投影坐标 → WGS84地理坐标
-        ogr_transform_->Transform(1, &result.x, &result.y, &result.z);
+        // 2. 投影坐标 → WGS84地理坐标(使用当前线程自己的转换对象)
+        if (auto* ct = GetThreadOGRTransform()) {
+            ct->Transform(1, &result.x, &result.y, &result.z);
+        }
 
         // 3. 应用Geoid高度校正
         result.z = ApplyGeoidCorrection(result.y, result.x, result.z);

@@ -4,6 +4,7 @@
 #include "GeoidHeight.h"
 #include <ogr_spatialref.h>
 #include <memory>
+#include <string>
 #include <vector>
 #include <glm/glm.hpp>
 
@@ -163,15 +164,13 @@ private:
     glm::dmat4 ecef_to_enu_{1.0};           // ECEF → ENU
     glm::dmat4 axis_transform_{1.0};        // 轴方向转换
 
-    // OGR坐标转换器(用于EPSG/WKT类型)
-    struct OGRCTDeleter {
-        void operator()(OGRCoordinateTransformation* pCT) const {
-            if (pCT != nullptr) {
-                OGRCoordinateTransformation::DestroyCT(pCT);
-            }
-        }
-    };
-    std::unique_ptr<OGRCoordinateTransformation, OGRCTDeleter> ogr_transform_;
+    // OGR坐标转换对象用于EPSG/WKT类型。GDAL/PROJ 的转换对象内部持有
+    // 不可跨线程共享的 PROJ 状态，因此每个线程按需创建并缓存自己的实例，
+    // 这里只保存用于标识源坐标系的键，用于判断线程缓存是否需要重建。
+    std::string ogr_transform_key_;
+
+    // 获取当前线程专属的 OGR 坐标转换对象(不存在或键不匹配时创建)
+    OGRCoordinateTransformation* GetThreadOGRTransform() const;
 
     // Geoid配置
     GeoidConfig geoid_config_;
