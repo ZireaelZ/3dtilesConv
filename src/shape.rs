@@ -45,15 +45,14 @@ use std::io::prelude::*;
 use std::path::Path;
 
 use serde_json;
-use std::f64::{INFINITY, NEG_INFINITY};
 
 // Compute geometricError from 3D corners (use half of max span)
 fn compute_geometric_error_from_corners(corners: &[[f64; 3]]) -> f64 {
     if corners.is_empty() {
         return 0.0;
     }
-    let mut min_v = [INFINITY; 3];
-    let mut max_v = [NEG_INFINITY; 3];
+    let mut min_v = [f64::INFINITY; 3];
+    let mut max_v = [f64::NEG_INFINITY; 3];
     for c in corners {
         for i in 0..3 {
             if c[i] < min_v[i] {
@@ -191,8 +190,8 @@ pub fn shape_batch_convert(
                 "children":[]
             }
         });
-        let mut root_min = [INFINITY, INFINITY, INFINITY];
-        let mut root_max = [NEG_INFINITY, NEG_INFINITY, NEG_INFINITY];
+        let mut root_min = [f64::INFINITY, f64::INFINITY, f64::INFINITY];
+        let mut root_max = [f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         let mut json_vec = vec![];
         walk_path(&Path::new(to).join("tile"), &mut |dir| {
             let file = File::open(dir).unwrap();
