@@ -82,7 +82,15 @@ fn build_win_msvc() {
     let mut config = Config::new(".");
     config
         .define("CMAKE_TOOLCHAIN_FILE", format!("{}/scripts/buildsystems/vcpkg.cmake", vcpkg_root))
+        .define(
+            "VCPKG_INSTALLED_DIR",
+            format!(
+                "{}/vcpkg_installed",
+                env::var("CARGO_MANIFEST_DIR").unwrap().replace('\\', "/")
+            ),
+        )
         .define("CMAKE_EXPORT_COMPILE_COMMANDS", "ON")
+        .define("VCPKG_MANIFEST_MODE", "OFF")
         .very_verbose(true);
 
     if enable_strict {
@@ -108,8 +116,7 @@ fn build_win_msvc() {
     export_compile_commands(Path::new(&out_dir));
     print_vcpkg_tree(Path::new(&out_dir)).unwrap();
     // vcpkg_installed path
-    let vcpkg_installed_dir = Path::new(&out_dir)
-        .join("build")
+    let vcpkg_installed_dir = Path::new(&source_dir)
         .join("vcpkg_installed")
         .join("x64-windows");
 
