@@ -6,6 +6,7 @@
 #include <osg/Array>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 // Add Basis Universal includes for KTX2 compression
 #include <basisu/encoder/basisu_comp.h>
@@ -43,7 +44,13 @@ bool compress_to_ktx2(const std::vector<unsigned char>& rgba_data, int width, in
 
         // FIX: https://github.com/fanvanzh/3dtiles/issues/372
         // Thanks to liyq0307
-        unsigned int basis_flags = quality_level | basisu::cFlagKTX2 | basisu::cFlagGenMipsWrap | basisu::cFlagThreaded;
+        unsigned int basis_flags = quality_level | basisu::cFlagKTX2 | basisu::cFlagGenMipsWrap;
+        // basisu 内部线程默认开启；遇到转换长时间不返回时可用 OTS_KTX2_THREADED=0
+        // 关闭，避免与顶层目录并行叠加出过多线程。
+        const char* ktx2_threaded = std::getenv("OTS_KTX2_THREADED");
+        if (ktx2_threaded == nullptr || std::strcmp(ktx2_threaded, "0") != 0) {
+            basis_flags |= basisu::cFlagThreaded;
+        }
 #ifdef DEBUG
         basis_flags |= basisu::cFlagDebug | basisu::cFlagPrintStatus;
 #endif
