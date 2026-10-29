@@ -4,8 +4,9 @@ extern crate serde;
 extern crate serde_json;
 
 use std::fs;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
-use rayon::prelude::*;
 
 use std::error::Error;
 use std::path::Path;
@@ -64,7 +65,6 @@ struct TileResult {
 struct OsgbInfo {
     in_dir: String,
     out_dir: String,
-    sender: ::std::sync::mpsc::Sender<TileResult>,
 }
 
 pub fn osgb_batch_convert(
@@ -110,7 +110,6 @@ pub fn osgb_batch_convert(
                 osgb_dir_pair.push(OsgbInfo {
                     in_dir: osgb.to_string_lossy().into(),
                     out_dir: out_dir.to_string_lossy().into(),
-                    sender: sender.clone(),
                 });
             } else {
                 error!("dir error: {}", osgb.display());
@@ -120,56 +119,123 @@ pub fn osgb_batch_convert(
 
     let rad_x = unsafe { degree2rad(center_x) };
     let rad_y = unsafe { degree2rad(center_y) };
-
     let max_lvl: i32 = max_lvl.unwrap_or(100);
-    osgb_dir_pair
-        .into_par_iter()
-        .map(|info| unsafe {
+
+    // 转换任务由固定数量的工作线程执行，主线程只负责收结果与监控：
+    // 任何一个顶层目录的转换长时间不返回时，主线程仍会写出已完成部分的
+    // tileset.json 并结束进程，外层封装不会永久等待引擎退出信号。
+    let total = task_count;
+    let threads = std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1)
+        .clamp(1, total.max(1));
+    info!("[osgb] {} 个顶层目录，使用 {} 个工作线程并行转换", total, threads);
+
+    let jobs = std::sync::Arc::new(
+        osgb_dir_pair
+            .into_iter()
+            .map(|info| (info.in_dir, info.out_dir))
+            .collect::<Vec<(String, String)>>(),
+    );
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..threads {
+        let jobs = jobs.clone();
+        let next = next.clone();
+        let sender = sender.clone();
+        std::thread::spawn(move || loop {
+            let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if index >= jobs.len() {
+                break;
+            }
+            let (in_dir, out_dir) = (&jobs[index].0, &jobs[index].1);
+            let tick = Instant::now();
+            info!("[osgb] begin convert {}", in_dir);
             let mut root_box = vec![0f64; 6];
             let mut json_buf = vec![];
             let mut json_len = 0i32;
-            let in_ptr = str_to_vec_c(&info.in_dir);
-            let out_ptr = str_to_vec_c(&info.out_dir);
-            let out_ptr = osgb23dtile_path(
-                in_ptr.as_ptr(),
-                out_ptr.as_ptr(),
-                root_box.as_mut_ptr(),
-                (&mut json_len) as *mut i32,
-                rad_x,
-                rad_y,
-                max_lvl,
-                enable_texture_compress,
-                enable_meshopt,
-                enable_draco_compress,
-                enable_unlit,
+            let in_ptr = str_to_vec_c(in_dir);
+            let out_ptr = str_to_vec_c(out_dir);
+            let out_ptr = unsafe {
+                osgb23dtile_path(
+                    in_ptr.as_ptr(),
+                    out_ptr.as_ptr(),
+                    root_box.as_mut_ptr(),
+                    (&mut json_len) as *mut i32,
+                    rad_x,
+                    rad_y,
+                    max_lvl,
+                    enable_texture_compress,
+                    enable_meshopt,
+                    enable_draco_compress,
+                    enable_unlit,
+                )
+            };
+            info!(
+                "[osgb] done convert {} in {:.1} s",
+                in_dir,
+                tick.elapsed().as_secs_f64()
             );
             if out_ptr.is_null() {
-                error!("failed: {}", info.in_dir);
+                error!("failed: {}", in_dir);
             } else {
                 json_buf.resize(json_len as usize, 0);
-                libc::memcpy(
-                    json_buf.as_mut_ptr() as *mut libc::c_void,
-                    out_ptr,
-                    json_len as usize,
-                );
-                libc::free(out_ptr);
+                unsafe {
+                    libc::memcpy(
+                        json_buf.as_mut_ptr() as *mut libc::c_void,
+                        out_ptr,
+                        json_len as usize,
+                    );
+                    libc::free(out_ptr);
+                }
             }
-            let t = TileResult {
-                path: info.out_dir.into(),
-                json: String::from_utf8(json_buf).unwrap(),
+            let tile = TileResult {
+                path: out_dir.clone(),
+                json: String::from_utf8(json_buf).unwrap_or_default(),
                 box_v: root_box,
             };
-            info.sender.send(t).unwrap();
-        })
-        .count();
-
-    // merge and root
-    let mut tile_array = vec![];
-    for _ in 0..task_count {
-        if let Ok(t) = receiver.recv() {
-            if !t.json.is_empty() {
-                tile_array.push(t);
+            if sender.send(tile).is_err() {
+                break;
             }
+        });
+    }
+    drop(sender);
+
+    // 主线程监控：每 5 s 检查是否有新结果。连续 OTS_ENGINE_TILE_IDLE（默认 900 s）
+    // 没有任何顶层目录完成时，判定该目录转换卡死，按已完成部分收尾。
+    let idle_limit = Duration::from_secs(
+        std::env::var("OTS_ENGINE_TILE_IDLE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(900),
+    );
+    let mut tile_array: Vec<TileResult> = vec![];
+    let mut received = 0usize;
+    let mut last_progress = Instant::now();
+    while received < total {
+        match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(t) => {
+                received += 1;
+                last_progress = Instant::now();
+                if !t.json.is_empty() {
+                    tile_array.push(t);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let idle = last_progress.elapsed();
+                if idle_limit.as_secs() > 0 && idle >= idle_limit {
+                    error!(
+                        "[osgb] 已 {} s 没有新的顶层目录完成（{}/{}），按已完成部分收尾并退出。",
+                        idle.as_secs(),
+                        received,
+                        total
+                    );
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     let mut root_box = vec![-1.0E+38f64, -1.0E+38, -1.0E+38, 1.0E+38, 1.0E+38, 1.0E+38];
@@ -270,6 +336,14 @@ pub fn osgb_batch_convert(
     let path_json = dir_dest.join("tileset.json");
     let mut f = File::create(path_json)?;
     f.write_all(serde_json::to_string_pretty(&root_json).unwrap().as_bytes())?;
+    if received < total {
+        warn!(
+            "[watchdog] {} 个顶层目录未完成，tileset.json 只含已完成部分；强制结束进程，避免外层永久等待退出信号。",
+            total - received
+        );
+        // 卡死的工作线程不会返回，这里直接结束进程（产物已全部落盘，退出不会损坏数据）。
+        std::process::exit(0);
+    }
     Ok(())
 }
 
