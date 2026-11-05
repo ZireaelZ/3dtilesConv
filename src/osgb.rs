@@ -200,7 +200,7 @@ pub fn osgb_batch_convert(
             if sender.send(tile).is_err() {
                 break;
             }
-        });
+        }));
     }
     drop(sender);
 
