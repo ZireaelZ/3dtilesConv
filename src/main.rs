@@ -739,13 +739,26 @@ fn convert_osgb(src: &str, dest: &str, config: &str, enable_simplify: bool, enab
         enu_offset, origin_height, enable_texture_compress, enable_simplify, enable_draco, enable_unlit)
     {
         error!("{}", e);
-        unsafe { fun_c::cleanup_global_resources(); }
-        return;
+        // 失败必须是失败：不能以 0 退出让外层把缺块产物当成功。
+        finish_process(1);
     }
     let elap_sec = tick.elapsed().unwrap();
     let tick_num = elap_sec.as_secs() as f64 + elap_sec.subsec_nanos() as f64 * 1e-9;
     info!("task over, cost {:.2} s.", tick_num);
-    unsafe { fun_c::cleanup_global_resources(); }
+    // 转换已经完成：刷日志后立即结束进程。
+    // 不再走 cleanup_global_resources()，也不让 main 正常返回到 C++ 静态析构：
+    // OSG/GDAL/PROJ 的静态析构在工作线程的 thread_local 对象刚析构时可能
+    // 互相等待或访问已释放的 PROJ context，表现为“task over 之后进程不退”
+    // 或退出瞬间 0xC0000005。exit(0) 跳过这些析构。
+    finish_process(0);
+}
+
+/// 刷干净 stdout/stderr 后结束进程（跳过 C++ 静态析构与 atexit 链）。
+fn finish_process(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
 }
 
 fn convert_shapefile(

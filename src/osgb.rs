@@ -141,11 +141,12 @@ pub fn osgb_batch_convert(
             .collect::<Vec<(String, String)>>(),
     );
     let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let jobs = jobs.clone();
         let next = next.clone();
         let sender = sender.clone();
-        std::thread::spawn(move || loop {
+        handles.push(std::thread::spawn(move || loop {
             let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if index >= jobs.len() {
                 break;
@@ -237,6 +238,16 @@ pub fn osgb_batch_convert(
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    if received >= total {
+        // 全部顶层目录已完成：等工作线程真正退出再收尾。
+        // 工作线程退出时会析构自己的 thread_local OGR 转换对象（DestroyCT）；
+        // 主线程若提前销毁全局资源，两边会在 PROJ/GDAL 的清理上互相等待，
+        // 表现为“已打印 task over，进程却一直不退”。
+        for h in handles {
+            let _ = h.join();
+        }
+        info!("[osgb] {} 个工作线程已全部退出", threads);
     }
     let mut root_box = vec![-1.0E+38f64, -1.0E+38, -1.0E+38, 1.0E+38, 1.0E+38, 1.0E+38];
     let mut root_geometric_error = 0.0;

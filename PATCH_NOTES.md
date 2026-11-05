@@ -14,6 +14,13 @@
    使用 `f64::INFINITY` / `f64::NEG_INFINITY` 常量，移除已弃用的 `std::f64` 导入。
 5. **Windows 本地构建支持**（`build.rs`）
    通过 CMake 变量 `VCPKG_INSTALLED_DIR` 指定依赖目录并关闭 manifest 模式，构建过程不创建符号链接，不需要管理员权限。
+6. **转换完成后可靠退出**（`src/osgb.rs`、`src/main.rs`）
+   保留工作线程句柄，全部顶层目录完成后逐个 `join()`，再写 tileset；`convert_osgb` 打印
+   `task over` 之后刷 stdout/stderr 并直接 `std::process::exit(0)`，跳过 `cleanup_global_resources()`
+   与 OSG/GDAL/PROJ 的 C++ 静态析构 —— 这条析构链会与工作线程退出时的 thread_local
+   `OGRCoordinateTransformation` 析构互相等待，或访问已释放的 PROJ context，表现为
+   “已打印 task over，进程一直不退出”，或在退出瞬间以 0xC0000005 结束。
+   转换失败时 `exit(1)`，不再以 0 退出把缺块产物交给外层。
 
 ## 构建（Windows x64）
 
