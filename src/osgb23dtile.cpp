@@ -1,5 +1,6 @@
 #include <osg/Material>
 #include <osg/PagedLOD>
+#include <osg/MatrixTransform>
 #include <osgDB/ReadFile>
 #include <osgDB/ConvertUTF>
 #include <osgUtil/Optimizer>
@@ -30,6 +31,7 @@
 #include <nlohmann/json.hpp>
 #include "extern.h"
 #include "coordinate_transformer.h"
+#include "osg_matrix_accum.h"
 
 using namespace std;
 
@@ -142,6 +144,7 @@ struct osg_tree {
 class InfoVisitor : public osg::NodeVisitor
 {
     std::string path;
+    osg::Matrixd accumulate;   // 从根到当前节点的变换，见 osg_matrix_accum.h
 public:
     InfoVisitor(std::string _path, bool loadAllType = false)
     :osg::NodeVisitor(TRAVERSE_ALL_CHILDREN)
@@ -151,11 +154,21 @@ public:
     ~InfoVisitor() {
     }
 
+    void apply(osg::MatrixTransform& node) override {
+        const osg::Matrixd saved = accumulate;
+        accumulate = node.getMatrix() * saved;
+        traverse(node);
+        accumulate = saved;
+    }
+
     void apply(osg::Geometry& geometry){
         if (geometry.getVertexArray() == nullptr
             || geometry.getVertexArray()->getDataSize() == 0U
             || geometry.getNumPrimitiveSets() == 0U)
             return;
+
+        // 顶点先落到世界坐标，后面的包围盒校正才是在同一帧里做的
+        osgb::apply_matrix_to_geometry(geometry, accumulate);
 
         if (is_pagedlod)
             geometry_array.push_back(&geometry);
